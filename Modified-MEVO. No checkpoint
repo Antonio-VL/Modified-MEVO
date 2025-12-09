@@ -1,0 +1,724 @@
+
+#Original article of MEVO: "MEVO: A Metamodel-Based Evolutionary Optimizer for Building Energy Optimization"
+
+
+#Modified-MEVO. No checkpoint 
+#This implementation was designed for Python through Google Colab 
+
+#pip install scikit-optimize
+
+
+# The following libraries are required:
+# pandas, matplotlib, scipy, sklearn
+
+from __future__ import annotations
+import subprocess
+import pandas as pd
+from matplotlib import pyplot as plt
+import shutil
+import fileinput
+from time import process_time, time
+from csv import reader
+import os
+import scipy.stats as st
+import random
+import sys
+import copy
+import csv
+import numpy as np
+import math
+from math import sqrt, exp, pi
+from numpy import vstack, argmin, asarray, array
+from numpy.random import uniform, random
+from sklearn.neural_network import MLPRegressor
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.svm import SVR
+from sklearn.gaussian_process.kernels import RBF, ConstantKernel as ConstantKer
+from warnings import catch_warnings, simplefilter
+from sklearn.preprocessing import MinMaxScaler
+from sklearn.metrics import r2_score, mean_squared_error
+from micropso import *
+from datetime import datetime
+
+####################################################################################
+# APARTADO DE CONFIGURACIÓN DEL ALGORITMO
+####################################################################################
+
+### INICIO: SEMILLA/SEED ALEATORIA PARA RESULTADOS REPETIBLES ###
+seed = 42
+random.seed(seed)
+np.random.seed(seed)
+
+# 1. MODO DE EVALUACIÓN DE RESULTADOS
+# Elije cómo se obtendrán los valores para SE y SR.
+# Opciones: 'manual' (el programa pedirá los valores) o 'automatic' (usará los modelos de regresión).
+EVALUATION_MODE = 'manual'
+
+# 2. MODO DE OPTIMIZACIÓN
+# Elige la estrategia general de optimización.
+# Opciones: "single_objective", "DF_SOO" (Deseabilidad Single-Objective), "DF_MOO" (Deseabilidad Multi-Objective).
+OPTIMIZATION_MODE = "DF_MOO"
+
+# 3. OBJETIVO DE OPTIMIZACIÓN
+# Si OPTIMIZATION_MODE es "single_objective" o "DF_SOO", elige la variable objetivo.
+# Opciones: "SE", "SR", "MRR".
+OPTIMIZATION_GOAL = "SR" # Solo relevante para "single_objective" y "DF_SOO"
+
+# 4. VARIABLES PARA DESEABILIDAD MULTIOBJETIVO (DF-MOO)
+# Si OPTIMIZATION_MODE es "DF_MOO", define aquí qué variables incluir.
+DF_MOO_VARIABLES = ["SE", "SR"] # Ejemplo: ["SE", "SR", "MRR"] para optimizar solo esas dos.
+
+# 5. INTENCIONES (MINIMIZAR/MAXIMIZAR)
+# Define la intención para cada variable. Esto se usa para las funciones de deseabilidad.
+OPTIMIZATION_INTENTIONS = {
+    "SE": "min",
+    "SR": "min",
+    "MRR": "max"
+}
+
+# 6. RANGOS PARA CÁLCULO DE DESEABILIDAD
+# Para cada variable, define su rango (ideal, peor) o (peor, ideal). Esto normalmente viene de los resultados del DoE
+DESIRABILITY_RANGES = {
+    "SE": (5.91011, 16.6839),    # (ideal, peor) para minimizar
+    "SR": (0.66150, 3.0100),    # (ideal, peor) para minimizar
+    "MRR": (3850.276383, 12994.682794) # (peor, ideal) para maximizar
+}
+
+# 7. PESOS (IMPORTANCIA) PARA DF-MOO
+# Asigna un peso de importancia a cada variable para la deseabilidad multiobjetivo.
+WEIGHTS = {"SE": 1, "SR": 1, "MRR": 1}
+
+# 8. CRITERIO DE PARADA Y OPERADORES
+MAX_EVALUATIONS = 16   #Modificable (Depende del limite de experimentos deseados)
+PROB_CROSSOVER = 0.1   #Modificable
+PROB_MUTATION = 0.2    #Modificable
+
+
+# 9. MODO DE DESEABILIDAD
+# Opciones: True (trunca los valores entre 0 y 1) o False (permite extrapolación)
+TRUNCATE_DESIRABILITY = True   #(+++Cambiar+++)
+
+# 10. ARCHIVO DE DATOS INICIALES
+# Nombre del archivo CSV que contiene los puntos de arranque
+CSV_FILE_NAME = 'LHS_MEVO_4_Points.csv'
+
+
+####################################################################################
+# FUNCIONES AUXILIARES Y DE MODELADO  ("surrogate", "adquisition" y "opt_acquisition_3d" vienen de MEVO original)
+####################################################################################
+
+
+
+### INICIO: FUNCIONES DE DESEABILIDAD ###  
+def calculate_desirability(value, range_min, range_max, goal='min'):
+    """
+    Calcula la deseabilidad.
+    Si TRUNCATE_DESIRABILITY (global) es True, trunca entre 0 y 1.
+    Si es False, usa extrapolación lineal (no acotada).
+    """
+
+    if goal == 'min':
+        ideal, worst = range_min, range_max
+        if ideal == worst:
+            result = 1.0 if value <= ideal else 0.0
+        else:
+            result = (worst - value) / (worst - ideal)
+
+
+        if TRUNCATE_DESIRABILITY:
+            result = max(0.0, min(1.0, result))
+
+
+        return result
+
+    else: # goal == 'max'
+        worst, ideal = range_min, range_max
+        if ideal == worst:
+            result = 1.0 if value >= ideal else 0.0
+        else:
+            result = (value - worst) / (ideal - worst)
+
+
+        if TRUNCATE_DESIRABILITY:
+            result = max(0.0, min(1.0, result))
+
+
+        return result
+### FIN: FUNCIONES DE DESEABILIDAD ###
+
+def calculate_mrr(x_point):
+    """Calcula la Tasa de Remoción de Material (MRR) a partir de un punto de entrada."""
+    D = 6.35 #[mm]
+    z = 4
+    #x1, x2, x3 = x_point[0], x_point[1], x_point[2]
+    #return D * x1 * (x2 *((1000*x3)/(pi * D))*z)
+    ap, fz, Vc = x_point[0], x_point[1], x_point[2]
+
+    
+
+    MRR = D * ap * (fz *((1000*Vc)/(pi * D))*z)
+    return MRR
+
+def predict_SE_automatico(x_point):
+    """Usa el modelo de regresión proporcionado para predecir SE."""
+    # Mapeo de variables: x1 -> ap, x2 -> fz, x3 -> Vc
+    # Se asume x_point[0]=x1, x_point[1]=x2, x_point[2]=x3
+    ap, fz, Vc = x_point[0], x_point[1], x_point[2]
+
+    SE = (90.894
+          - 30.501 * ap
+          - 851.2 * fz
+          - 0.62141 * Vc
+          + 4.216 * ap**2
+          + 3275.1 * fz**2
+          + 0.001871 * Vc**2
+          + 117.77 * ap * fz
+          + 0.07743 * ap * Vc
+          + 2.0918 * fz * Vc)
+    return SE
+
+def predict_SR_automatico(x_point):
+    """Usa el modelo de regresión proporcionado para predecir SR."""
+    # Mapeo de variables: x1 -> ap, x2 -> fz, x3 -> Vc
+    # Se asume x_point[0]=x1, x_point[1]=x2, x_point[2]=x3
+    ap, fz, Vc = x_point[0], x_point[1], x_point[2]
+
+    SR = (-3.098
+          + 2.595 * ap
+          + 92.6 * fz
+          - 0.00829 * Vc
+          - 0.767 * ap**2
+          - 578 * fz**2
+          )
+    return SR
+
+
+
+
+def evaluate_new_point(x_point):
+    # Paso 1: Obtener valores reales
+    if EVALUATION_MODE == 'automatic':
+        se_val = predict_SE_automatico(x_point)
+        sr_val = predict_SR_automatico(x_point)
+    else:
+        # ... (lógica manual sin cambios)
+        print("-" * 50); print(f"Evaluando nuevo punto manualmente: {np.round(x_point, 5)}")
+        se_val = float(input("--> Ingrese SE: "))
+        sr_val = float(input("--> Ingrese SR: "))
+        print("-" * 50)
+
+    mrr_val = calculate_mrr(x_point)
+    raw_values = {"SE": se_val, "SR": sr_val, "MRR": mrr_val}
+
+    # Paso 2: Calcular deseabilidades individuales
+    desirabilities = {}
+    for var, (range_min, range_max) in DESIRABILITY_RANGES.items():
+        goal = OPTIMIZATION_INTENTIONS[var]
+        desirabilities[var] = calculate_desirability(raw_values[var], range_min, range_max, goal)
+
+    # Paso 3: Calcular deseabilidad multiobjetivo (DF-MOO)
+    d_prod = 1.0
+    weight_sum = 0
+    active_vars = DF_MOO_VARIABLES
+    for var in active_vars:
+        # Añadimos la "pinza" (clamp) para evitar valores negativos en la base
+        base = desirabilities[var]
+        if base < 0:
+            base = 0
+
+        d_prod *= (base ** WEIGHTS[var])
+        weight_sum += WEIGHTS[var]
+
+    df_moo = d_prod ** (1 / weight_sum) if weight_sum > 0 else 0.0
+
+    # Paso 4: Seleccionar el valor objetivo para el optimizador
+    if OPTIMIZATION_MODE == "single_objective":
+        actual_value = raw_values[OPTIMIZATION_GOAL]
+        if OPTIMIZATION_INTENTIONS[OPTIMIZATION_GOAL] == 'max':
+            actual_value *= -1
+    elif OPTIMIZATION_MODE == "DF_SOO":
+        actual_value = -desirabilities[OPTIMIZATION_GOAL] # Siempre se maximiza deseabilidad
+    elif OPTIMIZATION_MODE == "DF_MOO":
+        actual_value = -df_moo # Siempre se maximiza deseabilidad
+    else:
+        # Esta línea captura cualquier valor no válido y da un error claro.
+        raise ValueError(f"El valor de OPTIMIZATION_MODE ('{OPTIMIZATION_MODE}') no es válido.")
+
+    # Paso 5: Devolver todos los resultados
+    results = {
+        'actual': actual_value, 'se': se_val, 'sr': sr_val, 'mrr': mrr_val,
+        'df_se': desirabilities['SE'], 'df_sr': desirabilities['SR'], 'df_mrr': desirabilities['MRR'],
+        'df_moo': df_moo
+    }
+    return results
+
+
+# surrogate or approximation for the objective function
+def surrogate(model, x1, x2, x3):
+    global scaler_x, scaler_y
+    Sol = [[x1, x2, x3]]
+    with catch_warnings():
+        simplefilter("ignore")
+        rescaledX = scaler_x.transform(Sol)
+        surr_prediction = model.predict(rescaledX)
+        surr_prediction = scaler_y.inverse_transform(surr_prediction.reshape(1, -1))
+        return surr_prediction[0][0], 0 # Devuelve valor y std dummy
+
+# Acquisition function
+def acquisition(x1, x2, x3):
+    yhat, _ = surrogate(model, x1, x2, x3)
+    return yhat
+
+# Optimize the acquisition function
+#(Si se usa Colab, agregar el archivo "micropso.py" en "Achivos" en la parte izquierda)
+def opt_acquisition_3d(X, model):
+    global lower_bound, upper_bound
+    pso = MicroEPSO(acquisition, (lower_bound, upper_bound),
+                      iterations=15, # iterations (inside loop)
+                      max_epochs=2, # max epochs (outside loop)
+                      population_size=20, # population size
+                      beta=0.9, # beta is the probability for a movement based on the global best
+                      alfa=0.6, # alfa is the probabiliy for a movement based on local best
+                      mu=0.5, # Mutation adding with probability mu a Gaussian perturbation
+                      sigma=0.7, # with standard deviation sigma
+                      gamma=0.7) # percentage of value taken from one parent in crossover
+                            # gamma=0 means siblings are equal to parents
+    pso.run()
+    return pso.global_best.best_particle
+
+
+
+
+####################################################################################
+# INICIO DEL SCRIPT PRINCIPAL
+####################################################################################
+
+# Lower and upper bounds of the decision variables
+upper_bound = [1.8, 0.063, 90]
+lower_bound = [1, 0.035, 50]#[1.2, 0.042, 60]
+
+# --- Bucle principal para múltiples ejecuciones (runs) ---
+number_of_runs = 1 #(runs ≠ iterations. Normalmente runs = 1)
+best_solution_array, best_cost_array, comp_time_array, act_time_array = [], [], [], []
+
+for run_num in range(number_of_runs):
+    print(f"\n--- INICIANDO EJECUCIÓN NÚMERO {run_num + 1}/{number_of_runs} ---")
+    start_act_time = time()
+    start_time = process_time()
+
+#### Registro para guardar todos los resultados (SE, SR, MRR) de cada punto
+    all_results_log = []
+
+    # Carga de datos iniciales. (Si se usa Colab, agregar el documento .csv en "Archivos)
+    df = pd.read_csv(CSV_FILE_NAME)
+
+
+    yactual = []
+    initial_points = []
+    for i in range(len(df)):
+        point = [df.iloc[i, 1], df.iloc[i, 2], df.iloc[i, 3]]
+        initial_points.append(point)
+
+        # Paso 1: Obtener los valores reales directamente (sin predicciones)
+        se_val = df.iloc[i, 4]
+        sr_val = df.iloc[i, 5]
+        mrr_val = calculate_mrr(point)
+        raw_values = {"SE": se_val, "SR": sr_val, "MRR": mrr_val}
+
+        # Paso 2: Calcular todas las deseabilidades (una sola vez)
+        desirabilities = {}
+        for var, (range_min, range_max) in DESIRABILITY_RANGES.items():
+            goal = OPTIMIZATION_INTENTIONS[var]
+            desirabilities[var] = calculate_desirability(raw_values[var], range_min, range_max, goal)
+
+        d_prod = 1.0
+        weight_sum = 0
+        for var in DF_MOO_VARIABLES:
+            if var in desirabilities and var in WEIGHTS:
+                base = desirabilities[var]
+                if base < 0: base = 0
+                d_prod *= (base ** WEIGHTS[var])
+                weight_sum += WEIGHTS[var]
+        df_moo = d_prod ** (1 / weight_sum) if weight_sum > 0 and d_prod >= 0 else 0.0
+
+        # Paso 3: Determinar el valor objetivo 'actual'
+        if OPTIMIZATION_MODE == "single_objective":
+            actual_value = raw_values[OPTIMIZATION_GOAL]
+            if OPTIMIZATION_INTENTIONS[OPTIMIZATION_GOAL] == 'max':
+                actual_value *= -1
+        elif OPTIMIZATION_MODE == "DF_SOO":
+            actual_value = -desirabilities[OPTIMIZATION_GOAL]
+        elif OPTIMIZATION_MODE == "DF_MOO":
+            actual_value = -df_moo
+        else:
+            raise ValueError(f"El valor de OPTIMIZATION_MODE ('{OPTIMIZATION_MODE}') no es válido.")
+
+        # Paso 4: Ensamblar el diccionario final y guardar los datos
+        results = {
+            'actual': actual_value, 'se': se_val, 'sr': sr_val, 'mrr': mrr_val,
+            'df_se': desirabilities['SE'], 'df_sr': desirabilities['SR'], 'df_mrr': desirabilities['MRR'],
+            'df_moo': df_moo
+        }
+        all_results_log.append(results)
+        yactual.append(results['actual'])
+
+    Xsamples = array(initial_points)
+    num_initial_points = len(initial_points)
+
+    # Definición y entrenamiento inicial del modelo sustituto (ANN)
+    model = MLPRegressor(hidden_layer_sizes=(8,), #2-5
+                         activation= 'logistic', # logistic, tanh, relu
+                         solver= 'lbfgs', #lbfgs, adam
+                         max_iter=500,
+                         learning_rate='adaptive',
+                         learning_rate_init=0.01,
+                         alpha=0.0001,
+                         random_state=None)
+
+    #Otras opciones de modelo:
+
+    #model = RandomForestRegressor(n_estimators=100, random_state=None)
+
+    #model = SVR(kernel='rbf', C=1, epsilon=0.05, gamma='scale') #C=regularization factor, epsilon=tolerance factor
+
+    scaler_x = MinMaxScaler().fit(Xsamples)
+    rescaledX = scaler_x.transform(Xsamples)
+    yactual_arr = asarray(yactual).reshape(-1, 1)
+    scaler_y = MinMaxScaler().fit(yactual_arr)
+    rescaledY = scaler_y.transform(yactual_arr)
+    model.fit(rescaledX, rescaledY.ravel())
+
+    # --- R2 y RMSE de Puntos iniciales LHS ---
+    y_pred_init = model.predict(rescaledX)
+    r2_init = r2_score(rescaledY, y_pred_init)
+    rmse_init = sqrt(mean_squared_error(rescaledY, y_pred_init)) #
+
+    print(f"\nINFO: Modelo inicial entrenado. R²: {r2_init:.4f} | RMSE: {rmse_init:.5f}")
+    # -------------------
+
+
+    # Preparación de archivos de reporte
+    now = datetime.now()
+    date_time = now.strftime("%Y%m%d_%H%M%S")
+    stats_file_name = f"statistics_{date_time}_run{run_num+1}.csv"
+    stats_file = open(stats_file_name, 'w', encoding='UTF8', newline='')
+    stats_writer = csv.writer(stats_file)
+    header = ['iter', 'type', 'x1', 'x2', 'x3', 'obj_value', 'best_obj_so_far',
+              'SE', 'SR', 'MRR', 'DF_SE', 'DF_SR', 'DF_MRR', 'DF_MOO', 'rmse', 'r2']
+    stats_writer.writerow(header)
+
+    convergence_file_name = f"convergence_{date_time}_run{run_num+1}.csv"
+    convergence_file = open(convergence_file_name, 'w', encoding='UTF8', newline='')
+    convergence_writer = csv.writer(convergence_file)
+    convergence_header = ['iter', 'best_x1', 'best_x2', 'best_x3', 'best_obj_value']
+    convergence_writer.writerow(convergence_header)
+    # Variables para la nueva narrativa de la salida
+    points_found_in_previous_iteration = 0
+    total_points_in_model = len(Xsamples)
+
+
+
+# --- Bucle de optimización ---
+    points_found_in_previous_iteration = 0
+    total_points_in_model = len(Xsamples)
+    evaluated_points_count = 0
+    iteration_num = 0
+    best_y_tracker = float('inf') #Registrar el mejor valor encontrado
+    convergence_data_plot = []
+    r_squared = 'N/A' ###
+
+    while evaluated_points_count < MAX_EVALUATIONS:
+        iteration_num += 1
+
+        print(f"\n{'='*20} Iteración {iteration_num} (Evaluaciones: {evaluated_points_count}/{MAX_EVALUATIONS}) {'='*20}")
+
+        # --- INICIA: NUEVO REPORTE DE INICIO DE ITERACIÓN ---
+        if iteration_num > 1: # No mostrar en la primera iteración
+            print(f"INFO: Se procede a evaluar {points_found_in_previous_iteration} punto(s) encontrado(s) en la iteración anterior.")
+            print(f"INFO: El modelo sustituto fue actualizado. Puntos totales en el modelo: {total_points_in_model}, incluyendo 4 del LHS")
+
+        points_found_this_iteration = 0
+        # --- FIN: NUEVO REPORTE ---
+
+        print("--- 1. Búsqueda de Punto Principal (Estratega) ---")
+
+        # 1. Optimizar la función de adquisición
+        x = opt_acquisition_3d(Xsamples, model)
+
+        ### INICIO: LÓGICA DE VERIFICACIÓN DE PUNTO REPETIDO (PRINCIPAL) ###
+        x_copy = np.round(x, 12)
+        Xsamples_list = np.round(Xsamples, 12).tolist()
+
+        point_is_new = True
+        if x_copy.tolist() in Xsamples_list:
+            print(f"Punto principal repetido detectado: {x_copy.tolist()}. Omitiendo re-evaluación.")
+            point_is_new = False
+            results = all_results_log[Xsamples_list.index(x_copy.tolist())]
+        else:
+          # 2. Evaluar el nuevo punto
+          # 3. Actualizar el conjunto de datos y re-entrenar el modelo
+            #actual, se_val, sr_val, mrr_val = evaluate_new_point(x)
+            results = evaluate_new_point(x)
+            evaluated_points_count += 1
+            points_found_this_iteration += 1
+            all_results_log.append(results)
+            Xsamples = vstack((Xsamples, x))
+            yactual.append(results['actual'])
+
+            current_best = min(yactual)
+            convergence_data_plot.append(current_best)
+
+        ### FIN: LÓGICA DE VERIFICACIÓN ###
+
+
+        # 4. Encontrar y reportar el mejor resultado hasta ahora
+        ix = argmin(yactual)
+        best_x_so_far = Xsamples[ix]
+        best_y_so_far = yactual[ix]
+
+
+        # 5. Calcular métricas de evalaución y registrar datos
+
+        #Metricas de evaluación del modelo
+        y_pred = model.predict(scaler_x.transform(Xsamples))
+        rescaledY_actual = scaler_y.transform(asarray(yactual).reshape(-1,1))
+        rmse = sqrt(mean_squared_error(rescaledY_actual, y_pred))
+        r_squared = r2_score(rescaledY_actual, y_pred)
+
+        
+
+
+
+        #print(f"Punto sugerido por PSO: {np.round(x, 5)} -> Resultado real (objetivo): {results['actual']:.5f}")
+        # Imprime el punto, los valores de entrada (SE/SR) y el objetivo
+        print(f"Punto sugerido por PSO: {np.round(x, 5)} -> SE: {results['se']:.5f}, SR: {results['sr']:.5f} -> Resultado (objetivo): {results['actual']:.5f}")
+        ix = argmin(yactual)
+        best_y_so_far = yactual[ix]
+        stats_data = [iteration_num, 'pso', x[0], x[1], x[2], results['actual'], best_y_so_far,
+                      results['se'], results['sr'], results['mrr'],
+                      results['df_se'], results['df_sr'], results['df_mrr'], results['df_moo'], rmse, r_squared]
+        stats_writer.writerow(stats_data)
+
+        convergence_data = [iteration_num, best_x_so_far[0], best_x_so_far[1], best_x_so_far[2], best_y_so_far]
+        convergence_writer.writerow(convergence_data)
+
+
+        # 6. Operadores Evolutivos (Opcional por probabilidad)(No se ha experimentado modificar los hyperparametros de los operadores, por sugerencia del Dr. Rafael. En su lugar nos enfocamos en el modelo)
+        # Crossover
+
+        if uniform() < PROB_CROSSOVER and evaluated_points_count < MAX_EVALUATIONS:
+            print("\n--- 2. Punto Opcional (Crossover) ---")
+            # Selección de padres elitista
+            best_n_sols = []
+            ordered_y_indices = np.argsort(yactual)
+            best_n = min(5, len(yactual)) # Tomar los 5 mejores o menos si no hay suficientes
+            for j in range(best_n):
+                best_n_sols.append(Xsamples[ordered_y_indices[j]])
+
+            # Elegir padres distintos del grupo de élite
+            k = 0
+            while True:
+                chosen_dad_idx = random.randint(0, best_n - 1)
+                dad = best_n_sols[chosen_dad_idx]
+                chosen_mom_idx = random.randint(0, best_n - 1)
+                mom = best_n_sols[chosen_mom_idx]
+                if list(dad) != list(mom) or k > best_n: break # Evitar bucle infinito
+                k += 1
+
+            # Aplicación del operador de cruce (mezcla por dimensión)
+            gamma = 0.7
+            alpha = [random.uniform(-gamma, 1 + gamma) for _ in range(len(dad))]
+            son = [alpha[j] * dad[j] + (1 - alpha[j]) * mom[j] for j in range(len(dad))]
+            son = np.clip(son, lower_bound, upper_bound)
+
+            ### INICIO: LÓGICA DE VERIFICACIÓN DE PUNTO REPETIDO (CROSSOVER) ###
+            son_copy = np.round(son, 12)
+            Xsamples_list = np.round(Xsamples, 12).tolist()
+
+            if son_copy.tolist() in Xsamples_list:
+                print(f"Punto de crossover repetido detectado...")
+            else: # Evaluar, actualizar y registrar el nuevo punto 'son'
+                results_son = evaluate_new_point(son)
+                #print(f"  -> Punto Crossover generado: {np.round(son, 5)} -> Resultado (objetivo): {results_son['actual']:.5f}")
+                # Imprime el punto, los valores de entrada (SE/SR) y el objetivo
+                print(f" 	-> Punto Crossover generado: {np.round(son, 5)} -> SE: {results_son['se']:.5f}, SR: {results_son['sr']:.5f} -> Resultado (objetivo): {results_son['actual']:.5f}")
+                evaluated_points_count += 1
+                points_found_this_iteration += 1
+                all_results_log.append(results_son)
+                Xsamples = vstack((Xsamples, son))
+                yactual.append(results_son['actual'])
+
+                current_best = min(yactual)
+                convergence_data_plot.append(current_best)
+
+                ix = argmin(yactual)
+                best_y_so_far = yactual[ix]
+                stats_data = [iteration_num, 'crossover', son[0], son[1], son[2], results_son['actual'], best_y_so_far,
+                            results_son['se'], results_son['sr'], results_son['mrr'],
+                            results_son['df_se'], results_son['df_sr'], results_son['df_mrr'], results_son['df_moo'], 'N/A', 'N/A']
+                stats_writer.writerow(stats_data)
+            ### FIN: LÓGICA DE VERIFICACIÓN ###
+
+        # Mutación
+        if uniform() < PROB_MUTATION and evaluated_points_count < MAX_EVALUATIONS:
+            print("\n--- 3. Punto Opcional (Mutación) ---")
+            # Selección del candidato (siempre el mejor)
+            # best_x_so_far ya contiene el mejor X
+
+            # Aplicación del operador de mutación (creep múltiple)
+            mu = 0.9
+            sigma = 0.1
+            mutated_X = [best_x_so_far[j] + sigma * random.random() if random.random() <= mu else best_x_so_far[j] for j in range(len(best_x_so_far))]
+            mutated_X = [mutated_X[j] - sigma * random.random() if random.random() <= mu else mutated_X[j] for j in range(len(mutated_X))]
+            mutated_X = np.clip(mutated_X, lower_bound, upper_bound)
+
+            ### INICIO: LÓGICA DE VERIFICACIÓN DE PUNTO REPETIDO (MUTACIÓN) ###
+            mutated_copy = np.round(mutated_X, 12)
+            Xsamples_list = np.round(Xsamples, 12).tolist()
+
+            if mutated_copy.tolist() in Xsamples_list:
+                print(f"Punto de mutación repetido detectado...")
+            else: # Evaluar, actualizar y registrar el nuevo punto mutado
+                results_mutation = evaluate_new_point(mutated_X)
+                #print(f"  -> Punto Mutado generado: {np.round(mutated_X, 5)} -> Resultado (objetivo): {results_mutation['actual']:.5f}")
+                # Imprime el punto, los valores de entrada (SE/SR) y el objetivo
+                print(f" 	-> Punto Mutado generado: {np.round(mutated_X, 5)} -> SE: {results_mutation['se']:.5f}, SR: {results_mutation['sr']:.5f} -> Resultado (objetivo): {results_mutation['actual']:.5f}")
+                evaluated_points_count += 1
+                points_found_this_iteration += 1
+                all_results_log.append(results_mutation)
+                Xsamples = vstack((Xsamples, mutated_X))
+                yactual.append(results_mutation['actual'])
+
+                current_best = min(yactual)
+                convergence_data_plot.append(current_best)
+
+                ix = argmin(yactual)
+                best_y_so_far = yactual[ix]
+                stats_data = [iteration_num, 'mutation', mutated_X[0], mutated_X[1], mutated_X[2], results_mutation['actual'], best_y_so_far,
+                              results_mutation['se'], results_mutation['sr'], results_mutation['mrr'],
+                              results_mutation['df_se'], results_mutation['df_sr'], results_mutation['df_mrr'], results_mutation['df_moo'], 'N/A', 'N/A']
+                stats_writer.writerow(stats_data)
+            ### FIN: LÓGICA DE VERIFICACIÓN ###
+
+        # Re-entrenar el modelo SI SE ENCONTRARON PUNTOS NUEVOS en esta iteración (Incluyendo puntos provenientes de PSO, Crossover o Mutation)
+        if points_found_this_iteration > 0:
+            print("\nINFO: Re-entrenando el modelo sustituto con los nuevos puntos...")
+            scaler_x = MinMaxScaler().fit(Xsamples)
+            rescaledX = scaler_x.transform(Xsamples)
+            yactual_arr = asarray(yactual).reshape(-1, 1)
+            scaler_y = MinMaxScaler().fit(yactual_arr)
+            rescaledY = scaler_y.transform(yactual_arr)
+            model.fit(rescaledX, rescaledY.ravel())
+
+        # --- INICIA: NUEVO REPORTE DE FIN DE ITERACIÓN ---
+        print(f"\n--- 📌 Resumen de la Iteración {iteration_num} ---")
+
+        # Verificamos si se encontró un nuevo mejor resultado EN ESTA ITERACIÓN
+        ix = argmin(yactual)
+        best_y_so_far = yactual[ix]
+
+        if best_y_so_far < best_y_tracker:
+            best_x_so_far = Xsamples[ix]
+            summary_notification = (f"💡 ¡Nuevo Mejor Resultado Encontrado!: y= {best_y_so_far:.5f} en X= {np.round(best_x_so_far, 5)}")
+            best_y_tracker = best_y_so_far # Actualizamos el récord
+        else:
+            summary_notification = "No se encontró un nuevo mejor resultado."
+
+        print(f"Puntos nuevos encontrados en esta iteración: {points_found_this_iteration}")
+        print(f"Puntos totales evaluados hasta el momento: {evaluated_points_count}")
+        print(summary_notification) # Imprimimos la notificación
+        #Metricas de evaluacion (R2, RMSE)
+        if isinstance(r_squared, float):
+            print(f"Calidad del modelo actualizado -> R²: {r_squared:.4f} | RMSE: {rmse:.5f}")
+
+        # Preparamos las variables para la siguiente iteración
+        points_found_in_previous_iteration = points_found_this_iteration
+        total_points_in_model += points_found_this_iteration
+        # --- FIN: NUEVO REPORTE ---
+
+    stats_file.close()
+    convergence_file.close()
+
+
+    # Reporte final de la ejecución
+    final_ix = argmin(yactual)
+    final_best_X = Xsamples[final_ix]
+    final_best_y = yactual[final_ix]
+    final_results = all_results_log[final_ix] # La única fuente de verdad para todos los valores
+
+    if final_ix < num_initial_points:
+        found_at_message = "La mejor solución fue uno de los puntos iniciales (del archivo CSV)."
+    else:
+        evaluation_number = final_ix - num_initial_points + 1
+        found_at_message = f"Fue encontrada en la evaluación número: {evaluation_number}"
+
+    print("\n" + "="*50)
+    print(f"🏁 FIN DE LA EJECUCIÓN {run_num + 1} 🏁")
+    print("="*50)
+
+    print(f"🎯 Modo de Optimización: {OPTIMIZATION_MODE} (Evaluación: {EVALUATION_MODE})")
+    if OPTIMIZATION_MODE == "DF_MOO":
+        print(f"   -> Variables Combinadas: {DF_MOO_VARIABLES}")
+    else:
+        print(f"   -> Variable Objetivo: {OPTIMIZATION_GOAL}")
+
+    print(f"\nMejor valor objetivo encontrado: {final_best_y:.5f}")
+    if "DF" in OPTIMIZATION_MODE:
+        print(f"   -> Deseabilidad maximizada: {-final_best_y:.5f}")
+
+    print(f"   -> {found_at_message}")
+    print(f"Con los parámetros (x1, x2, x3): {np.round(final_best_X, 5)}")
+
+    print("\n--- Valores de Salida para la Mejor Solución ---")
+    print(f"Consumo de Energía (SE): {final_results['se']:.5f}")
+    print(f"Rugosidad (SR):          {final_results['sr']:.5f}")
+    print(f"Tasa de Remoción (MRR):  {final_results['mrr']:.5f}")
+
+    print("\n--- Puntuaciones de Deseabilidad ---")
+    print(f"DF_SE:    {final_results['df_se']:.5f}")
+    print(f"DF_SR:    {final_results['df_sr']:.5f}")
+    print(f"DF_MRR:   {final_results['df_mrr']:.5f}")
+    print(f"DF_MOO:   {final_results['df_moo']:.5f}")
+    print("-" * 45)
+
+    comp_time_ms = (process_time() - start_time) * 1000
+    elapsed_time_ms = (time() - start_act_time) * 1000
+    print(f"Tiempo total transcurrido: {elapsed_time_ms:.2f} ms")
+    print("="*50)
+
+    # --- INICIA BLOQUE PARA GRAFICAR ---
+    if convergence_data_plot:
+        plt.figure(figsize=(10, 6))
+
+        # El eje X son los números de evaluación (1, 2, 3, ...)
+        evaluations_axis = range(1, len(convergence_data_plot) + 1)
+
+        plt.plot(evaluations_axis, convergence_data_plot, marker='o', linestyle='-', color='b')
+
+        plt.title('Convergence graph', fontsize=16)
+        plt.xlabel('No. Evaluations', fontsize=12)
+        plt.ylabel('Best solution found (Composite Desirability)', fontsize=12)
+        plt.grid(True, which='both', linestyle='--', linewidth=0.5)
+
+        # Asegurarse de que el eje X tenga solo números enteros
+        plt.xticks(np.arange(1, len(convergence_data_plot) + 1, 1))
+
+        plt.show()
+    # --- FIN BLOQUE PARA GRAFICAR ---
+
+
+    best_solution_array.append(final_best_X)
+    best_cost_array.append(final_best_y)
+    comp_time_array.append(comp_time_ms)
+    act_time_array.append(elapsed_time_ms)
+
+
+# Guardar los resultados de todas las ejecuciones
+df_runs = pd.DataFrame()
+df_runs['Solution'] = pd.Series(best_solution_array)
+df_runs['Cost'] = pd.Series(best_cost_array)
+df_runs['Comp time (ms)'] = pd.Series(comp_time_array)
+df_runs['Elapsed time (ms)'] = pd.Series(act_time_array)
+df_runs.to_csv('summary_of_all_runs.csv')
+
+print("\nOptimización completada. Resumen guardado en 'summary_of_all_runs.csv'")
