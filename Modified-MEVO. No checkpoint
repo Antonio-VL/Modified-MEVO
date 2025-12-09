@@ -3,7 +3,8 @@
 
 
 #Modified-MEVO. No checkpoint 
-#This implementation was designed for Python through Google Colab 
+
+#This modified implementation was designed for Python through Google Colab, with the assistance of Gemini
 
 #pip install scikit-optimize
 
